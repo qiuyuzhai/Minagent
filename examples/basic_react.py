@@ -1,9 +1,9 @@
-"""最小 ReAct 循环示例。
+"""最小 ReAct 循环示例（P2 版：用 ToolRegistry + ToolExecutor）。
 
-用计算器工具验证 agent loop：
+用计算器 + read_file 两个工具验证 agent loop：
 1. 用户问"15 乘以 4 再加 12 是多少"
 2. LLM 决定调用 calculator 工具
-3. agent loop 执行工具，把结果返回给 LLM
+3. ToolExecutor 执行工具（parallel 模式），结果按原序返回
 4. LLM 给出最终答案
 
 运行前设置环境变量（任选一个 provider）：
@@ -19,61 +19,22 @@
 """
 
 import asyncio
-import json
 import os
 
-from minagent.events import EventStream, AgentEvent
-from minagent.llm import LLMProvider, ModelConfig, OpenAICompatibleProvider
+from minagent.events import AgentEvent, EventStream
+from minagent.llm import ModelConfig, OpenAICompatibleProvider
 from minagent.loop import AgentContext, AgentLoopConfig, agent_loop
-from minagent.messages import ToolCall
+from minagent.tools import ToolExecutor, ToolRegistry
+from minagent.tools.builtin import CalculatorTool, ReadFileTool
 
 
-# ---------------------------------------------------------------------------
-# 工具定义：计算器（P1 简单版，P2 会用 ToolRegistry + pydantic schema）
-# ---------------------------------------------------------------------------
+def build_registry() -> ToolRegistry:
+    """构建工具注册表。"""
+    reg = ToolRegistry()
+    reg.register(CalculatorTool())   # parallel 模式
+    reg.register(ReadFileTool())     # sequential 模式
+    return reg
 
-def calculator_execute(tool_call: ToolCall) -> str:
-    """计算器工具：支持四则运算。
-
-    P1 版直接 eval，P2 会换成安全的 AST 解析。
-    """
-    expr = tool_call.arguments.get("expression", "")
-    if not expr:
-        return "ERROR: missing 'expression' argument"
-    try:
-        # P1 简单版：限制字符集后 eval
-        allowed = set("0123456789+-*/(). ")
-        if not all(c in allowed for c in expr):
-            return f"ERROR: invalid expression: {expr}"
-        result = eval(expr, {"__builtins__": {}}, {})
-        return f"{expr} = {result}"
-    except Exception as e:
-        return f"ERROR: {e}"
-
-
-# OpenAI function calling schema
-CALCULATOR_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "calculator",
-        "description": "四则运算计算器。输入数学表达式，返回计算结果。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "数学表达式，如 '15 * 4 + 12'",
-                },
-            },
-            "required": ["expression"],
-        },
-    },
-}
-
-
-# ---------------------------------------------------------------------------
-# 事件打印器（模拟 UI 订阅事件流）
-# ---------------------------------------------------------------------------
 
 async def print_events(stream: EventStream) -> None:
     """订阅事件流，打印每个事件。"""
@@ -82,7 +43,6 @@ async def print_events(stream: EventStream) -> None:
 
 
 def _print_event(event: AgentEvent) -> None:
-    """打印单个事件。"""
     t = event.type
     if t == "agent_start":
         print("\n=== agent_start ===")
@@ -105,15 +65,10 @@ def _print_event(event: AgentEvent) -> None:
         status = "ERROR" if event.is_error else "ok"
         print(f"  [tool result: {status}]")
     elif t == "tool_result_message":
-        # 打印工具结果内容
         for trc in event.message.content:
             for tc in trc.content:
                 print(f"  -> {tc.text}")
 
-
-# ---------------------------------------------------------------------------
-# 主函数
-# ---------------------------------------------------------------------------
 
 async def main() -> None:
     # 1. 配置模型（自动检测 provider）
@@ -122,28 +77,38 @@ async def main() -> None:
         provider="auto",
     )
     provider = OpenAICompatibleProvider(model_config)
-    print(f"✅ Provider: {provider.provider_name}, Model: {provider.model}")
+    print(f"Provider: {provider.provider_name}, Model: {provider.model}")
 
-    # 2. 配置 agent context
-    context = AgentContext(
-        system_prompt="你是一个能使用计算器工具的助手。需要计算时调用 calculator 工具。",
-        tools=[CALCULATOR_TOOL],
+    # 2. 构建工具注册表 + 执行器
+    registry = build_registry()
+    print(f"Tools: {[t.name for t in registry.list_tools()]}")
+
+    executor = ToolExecutor(
+        registry,
+        before_tool_call=lambda ctx: None,  # 可加权限拦截
+        default_execution_mode="parallel",
     )
 
-    # 3. 配置 agent loop
+    # 3. 配置 agent context
+    context = AgentContext(
+        system_prompt="你是一个能使用计算器和文件读取工具的助手。需要计算时调用 calculator。",
+        tools=registry.to_openai_schemas(),
+    )
+
+    # 4. 配置 agent loop（P2 路径：tool_executor）
     config = AgentLoopConfig(
         model_config=model_config,
         max_turns=10,
-        execute_tool=calculator_execute,
+        tool_executor=executor,
     )
 
-    # 4. 启动 agent loop
+    # 5. 启动 agent loop
     prompt = "请帮我计算：15 乘以 4，然后加上 12 是多少？"
-    print(f"\n🤖 用户: {prompt}")
+    print(f"\n用户: {prompt}")
 
     stream = await agent_loop(prompt, context, config, provider)
 
-    # 5. 订阅事件流（边产生边打印）
+    # 6. 订阅事件流
     await print_events(stream)
 
 

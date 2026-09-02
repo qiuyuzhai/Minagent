@@ -16,7 +16,7 @@
 ## 开发阶段
 
 - [x] P1：messages + events + loop + llm（最小 ReAct 循环）
-- [ ] P2：tools（registry + executor + builtin）
+- [x] P2：tools（ToolRegistry + ToolExecutor + pydantic schema + sequential/parallel 双模式 + before/after 钩子）
 - [ ] P3：control（abort + steering + follow-up）
 - [ ] P4：memory（episodic + long_term + hybrid retrieval）
 

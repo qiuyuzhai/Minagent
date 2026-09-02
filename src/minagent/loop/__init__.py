@@ -43,6 +43,7 @@ from minagent.messages import (
     UserMessage,
     convert_to_llm,
 )
+from minagent.tools import ToolExecutor
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +91,9 @@ class AgentLoopConfig:
     should_stop_after_turn: ShouldStopAfterTurn | None = None
     prepare_next_turn: PrepareNextTurn | None = None
     transform_context: TransformContext | None = None
-    # 工具执行函数（P1 简单版，P2 会换成 ToolExecutor）
+    # 工具执行器（P2 新增，优先使用）
+    tool_executor: ToolExecutor | None = None
+    # P1 简单版 execute_tool（向后兼容，tool_executor 优先）
     execute_tool: ExecuteTool | None = None
 
 
@@ -167,7 +170,17 @@ async def _run_loop(
             tool_results: list[ToolResultMessage] = []
             tool_calls = assistant_msg.tool_calls
 
-            if tool_calls and config.execute_tool:
+            if tool_calls and config.tool_executor:
+                # P2 路径：用 ToolExecutor（sequential/parallel + 钩子）
+                batch = await config.tool_executor.execute(tool_calls, stream)
+                for tr_msg in batch.messages:
+                    tool_results.append(tr_msg)
+                    context.messages.append(tr_msg)
+                    new_messages.append(tr_msg)
+                    await stream.emit(ToolResultMessageEvent(message=tr_msg))
+                has_more_tool_calls = not batch.terminate
+            elif tool_calls and config.execute_tool:
+                # P1 路径：简单 callable（向后兼容）
                 for tc in tool_calls:
                     await stream.emit(
                         ToolExecutionStartEvent(
@@ -189,7 +202,6 @@ async def _run_loop(
                         ToolExecutionEndEvent(tool_call_id=tc.id, is_error=is_error)
                     )
                     await stream.emit(ToolResultMessageEvent(message=tr_msg))
-
                 has_more_tool_calls = True
             else:
                 has_more_tool_calls = False
