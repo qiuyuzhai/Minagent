@@ -44,6 +44,7 @@ from minagent.messages import (
     convert_to_llm,
 )
 from minagent.tools import ToolExecutor
+from minagent.control import AbortController, FollowUpQueue, SteeringQueue, TimeoutManager
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +96,11 @@ class AgentLoopConfig:
     tool_executor: ToolExecutor | None = None
     # P1 简单版 execute_tool（向后兼容，tool_executor 优先）
     execute_tool: ExecuteTool | None = None
+    # P3 控制层
+    abort_controller: AbortController | None = None
+    steering_queue: SteeringQueue | None = None
+    follow_up_queue: FollowUpQueue | None = None
+    timeout_manager: TimeoutManager | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -146,87 +152,131 @@ async def _run_loop(
     stream: EventStream,
     new_messages: list[AnyAgentMessage],
 ) -> None:
-    """主循环逻辑。"""
+    """主循环逻辑。
+
+    P3 双层循环：
+    - 外层：follow-up 续跑（agent 自然停止后，队列有消息则重启）
+    - 内层：turn 循环（stream → 工具 → steering 注入 → 检查停止）
+    """
     await stream.emit(AgentStartEvent())
 
     try:
-        turn_index = 0
-        has_more_tool_calls = True
+        # follow-up 外层循环
+        follow_up_active = True
+        while follow_up_active:
+            turn_index = 0
+            has_more_tool_calls = True
 
-        while has_more_tool_calls and turn_index < config.max_turns:
-            turn_index += 1
-            await stream.emit(TurnStartEvent(turn_index=turn_index))
-
-            # 1. stream assistant response
-            assistant_msg = await _stream_assistant(context, config, provider, stream)
-            context.messages.append(assistant_msg)
-            new_messages.append(assistant_msg)
-
-            if assistant_msg.stop_reason in ("error", "aborted"):
-                await stream.emit(TurnEndEvent(message=assistant_msg, tool_results=[]))
-                break
-
-            # 2. 执行工具
-            tool_results: list[ToolResultMessage] = []
-            tool_calls = assistant_msg.tool_calls
-
-            if tool_calls and config.tool_executor:
-                # P2 路径：用 ToolExecutor（sequential/parallel + 钩子）
-                batch = await config.tool_executor.execute(tool_calls, stream)
-                for tr_msg in batch.messages:
-                    tool_results.append(tr_msg)
-                    context.messages.append(tr_msg)
-                    new_messages.append(tr_msg)
-                    await stream.emit(ToolResultMessageEvent(message=tr_msg))
-                has_more_tool_calls = not batch.terminate
-            elif tool_calls and config.execute_tool:
-                # P1 路径：简单 callable（向后兼容）
-                for tc in tool_calls:
-                    await stream.emit(
-                        ToolExecutionStartEvent(
-                            tool_call_id=tc.id, tool_name=tc.name, arguments=tc.arguments
-                        )
-                    )
-                    result_text = config.execute_tool(tc)
-                    is_error = result_text.startswith("ERROR:")
-                    tr_content = ToolResultContent(
-                        tool_call_id=tc.id,
-                        content=[TextContent(text=result_text)],
-                        is_error=is_error,
-                    )
-                    tr_msg = ToolResultMessage(content=[tr_content])
-                    tool_results.append(tr_msg)
-                    context.messages.append(tr_msg)
-                    new_messages.append(tr_msg)
-                    await stream.emit(
-                        ToolExecutionEndEvent(tool_call_id=tc.id, is_error=is_error)
-                    )
-                    await stream.emit(ToolResultMessageEvent(message=tr_msg))
-                has_more_tool_calls = True
-            else:
-                has_more_tool_calls = False
-
-            await stream.emit(TurnEndEvent(message=assistant_msg, tool_results=tool_results))
-
-            # 3. should_stop_after_turn 钩子
-            turn_ctx = TurnContext(
-                message=assistant_msg,
-                tool_results=tool_results,
-                context=context,
-                new_messages=new_messages,
-            )
-            if config.should_stop_after_turn:
-                stop = config.should_stop_after_turn(turn_ctx)
-                if isinstance(stop, Awaitable):
-                    stop = await stop  # type: ignore[assignment]
-                if stop:
+            while has_more_tool_calls and turn_index < config.max_turns:
+                # P3: 检查 abort
+                if config.abort_controller and config.abort_controller.is_aborted():
                     break
 
-            # 4. prepare_next_turn 钩子（P1 简化，只打日志）
-            # P3 会在这里动态切 model / context
+                turn_index += 1
+                await stream.emit(TurnStartEvent(turn_index=turn_index))
+
+                # 1. stream assistant response（支持 turn 级超时）
+                if config.timeout_manager and config.timeout_manager.turn_timeout:
+                    try:
+                        assistant_msg = await config.timeout_manager.run_with_turn_timeout(
+                            _stream_assistant(context, config, provider, stream)
+                        )
+                    except TimeoutError:
+                        # turn 超时，触发 abort
+                        if config.abort_controller:
+                            config.abort_controller.abort("turn timeout")
+                        break
+                else:
+                    assistant_msg = await _stream_assistant(context, config, provider, stream)
+
+                context.messages.append(assistant_msg)
+                new_messages.append(assistant_msg)
+
+                if assistant_msg.stop_reason in ("error", "aborted"):
+                    await stream.emit(TurnEndEvent(message=assistant_msg, tool_results=[]))
+                    break
+
+                # 2. 执行工具（传 abort signal）
+                tool_results: list[ToolResultMessage] = []
+                tool_calls = assistant_msg.tool_calls
+                signal = config.abort_controller.signal if config.abort_controller else None
+
+                if tool_calls and config.tool_executor:
+                    batch = await config.tool_executor.execute(tool_calls, stream, signal)
+                    for tr_msg in batch.messages:
+                        tool_results.append(tr_msg)
+                        context.messages.append(tr_msg)
+                        new_messages.append(tr_msg)
+                        await stream.emit(ToolResultMessageEvent(message=tr_msg))
+                    has_more_tool_calls = not batch.terminate
+                elif tool_calls and config.execute_tool:
+                    for tc in tool_calls:
+                        await stream.emit(
+                            ToolExecutionStartEvent(
+                                tool_call_id=tc.id, tool_name=tc.name, arguments=tc.arguments
+                            )
+                        )
+                        result_text = config.execute_tool(tc)
+                        is_error = result_text.startswith("ERROR:")
+                        tr_content = ToolResultContent(
+                            tool_call_id=tc.id,
+                            content=[TextContent(text=result_text)],
+                            is_error=is_error,
+                        )
+                        tr_msg = ToolResultMessage(content=[tr_content])
+                        tool_results.append(tr_msg)
+                        context.messages.append(tr_msg)
+                        new_messages.append(tr_msg)
+                        await stream.emit(
+                            ToolExecutionEndEvent(tool_call_id=tc.id, is_error=is_error)
+                        )
+                        await stream.emit(ToolResultMessageEvent(message=tr_msg))
+                    has_more_tool_calls = True
+                else:
+                    has_more_tool_calls = False
+
+                await stream.emit(TurnEndEvent(message=assistant_msg, tool_results=tool_results))
+
+                # P3: abort 后停止
+                if config.abort_controller and config.abort_controller.is_aborted():
+                    break
+
+                # 3. should_stop_after_turn 钩子
+                turn_ctx = TurnContext(
+                    message=assistant_msg,
+                    tool_results=tool_results,
+                    context=context,
+                    new_messages=new_messages,
+                )
+                if config.should_stop_after_turn:
+                    stop = config.should_stop_after_turn(turn_ctx)
+                    if isinstance(stop, Awaitable):
+                        stop = await stop  # type: ignore[assignment]
+                    if stop:
+                        break
+
+                # P3: steering 注入——turn 结束后 drain，注入 context
+                if config.steering_queue and not config.steering_queue.is_empty():
+                    steering_msgs = config.steering_queue.drain()
+                    for sm in steering_msgs:
+                        context.messages.append(sm)
+                        new_messages.append(sm)
+                        # steering 消息让 loop 继续（LLM 下一轮会看到）
+                        has_more_tool_calls = True
+
+            # P3: follow-up 检查——agent 自然停止后，队列有消息则续跑
+            if config.follow_up_queue and not config.follow_up_queue.is_empty():
+                follow_up_msgs = config.follow_up_queue.drain()
+                for fm in follow_up_msgs:
+                    context.messages.append(fm)
+                    new_messages.append(fm)
+                # 有 follow-up 消息，重启内层循环
+                follow_up_active = True
+            else:
+                follow_up_active = False
 
         await stream.end(new_messages)
-    except Exception as e:
+    except Exception:
         # 错误也结束流，避免消费者卡住
         await stream.end(new_messages)
 
