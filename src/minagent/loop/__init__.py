@@ -45,6 +45,7 @@ from minagent.messages import (
 )
 from minagent.tools import ToolExecutor
 from minagent.control import AbortController, FollowUpQueue, SteeringQueue, TimeoutManager
+from minagent.memory import EpisodicMemory, LongTermMemory, Memory
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +102,9 @@ class AgentLoopConfig:
     steering_queue: SteeringQueue | None = None
     follow_up_queue: FollowUpQueue | None = None
     timeout_manager: TimeoutManager | None = None
+    # P4 记忆层
+    long_term_memory: LongTermMemory | None = None  # 长期记忆（跨会话）
+    memory_top_k: int = 5  # 每轮注入的记忆条数
 
 
 # ---------------------------------------------------------------------------
@@ -157,8 +161,30 @@ async def _run_loop(
     P3 双层循环：
     - 外层：follow-up 续跑（agent 自然停止后，队列有消息则重启）
     - 内层：turn 循环（stream → 工具 → steering 注入 → 检查停止）
+    P4 记忆注入：
+    - 开始时从长期记忆检索相关条目，注入 context
+    - 每轮 assistant 响应后，把重要信息存入长期记忆
     """
     await stream.emit(AgentStartEvent())
+
+    # P4: 注入长期记忆（before_agent_start）
+    if config.long_term_memory and context.messages:
+        # 用最后一条 user 消息作为 query
+        last_user_text = ""
+        for msg in reversed(context.messages):
+            if isinstance(msg, UserMessage):
+                last_user_text = msg.content[0].text if msg.content else ""
+                break
+        if last_user_text:
+            memories = await config.long_term_memory.retrieve(last_user_text, top_k=config.memory_top_k)
+            if memories:
+                # 注入为 system 消息（在 system_prompt 之后）
+                memory_text = "\n".join(f"- {m.content}" for m in memories)
+                injection = SystemMessage(
+                    content=f"[相关记忆]\n{memory_text}",
+                )
+                context.messages.append(injection)
+                new_messages.append(injection)
 
     try:
         # follow-up 外层循环
@@ -274,6 +300,18 @@ async def _run_loop(
                 follow_up_active = True
             else:
                 follow_up_active = False
+
+        # P4: 保存重要信息到长期记忆
+        if config.long_term_memory:
+            for msg in new_messages:
+                if isinstance(msg, AssistantMessage) and msg.text:
+                    # 只存有实质内容的 assistant 消息（跳过纯工具调用）
+                    if len(msg.text) > 10:  # 跳过太短的
+                        from minagent.memory import MemoryEntry
+                        await config.long_term_memory.add(MemoryEntry(
+                            content=msg.text,
+                            metadata={"type": "assistant_response", "source": "assistant"},
+                        ))
 
         await stream.end(new_messages)
     except Exception:

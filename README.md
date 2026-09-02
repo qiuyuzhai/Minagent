@@ -18,7 +18,7 @@
 - [x] P1：messages + events + loop + llm（最小 ReAct 循环）
 - [x] P2：tools（ToolRegistry + ToolExecutor + pydantic schema + sequential/parallel 双模式 + before/after 钩子）
 - [x] P3：control（AbortController + SteeringQueue + FollowUpQueue + TimeoutManager）
-- [ ] P4：memory（episodic + long_term + hybrid retrieval）
+- [x] P4：memory（EpisodicMemory + LongTermMemory + HybridRetriever BM25+Vector RRF）
 
 ## 技术栈
 
